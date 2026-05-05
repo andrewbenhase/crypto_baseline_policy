@@ -1,0 +1,454 @@
+# crypto_baseline_policy
+Tetragon Crypto Baseline Policy
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: baseline-crypto-policy
+  annotations:
+    description: >
+      Baseline Security Policy for crypto visibility, OpenSSL abuse monitoring,
+      outbound Internet SSH detection, OpenSSL directory access monitoring,
+      and staged CNSA/PQC enforcement readiness.
+    mode: "monitor-alert-first"
+    enforcement: "disabled-by-default"
+spec:
+
+  ###########################################################################
+  # POLICY INTENT
+  #
+  # This policy is designed to provide:
+  #
+  # 1. Crypto-capable binary execution inventory
+  # 2. OpenSSL rogue-use monitoring
+  # 3. Private key and certificate access visibility
+  # 4. OpenSSL shared library and provider/module visibility
+  # 5. Outbound Internet SSH monitoring
+  # 6. Any-process access to OpenSSL directories
+  # 7. RSA/ECDSA signing detection via OpenSSL uprobes
+  # 8. Optional future enforcement gates
+  #
+  # Default behavior:
+  #   - MONITOR / ALERT ONLY
+  #   - Uses action: Post
+  #
+  # Optional enforcement:
+  #   - Change selected action: Post entries to action: Sigkill
+  #   - Only after validating telemetry and allowlists
+  ###########################################################################
+
+  kprobes:
+
+  ###########################################################################
+  # A) MONITOR: Crypto-capable binary execution inventory
+  ###########################################################################
+  - call: "sys_execve"
+    syscall: true
+    args:
+    - index: 0
+      type: "string"     # executed binary
+    - index: 1
+      type: "string"     # argv, best-effort/truncated
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "In"
+        values:
+        - "/usr/bin/openssl"
+        - "/usr/bin/ssh"
+        - "/usr/sbin/sshd"
+        - "/usr/bin/curl"
+        - "/usr/bin/wget"
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/haproxy"
+        - "/usr/sbin/httpd"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # B) MONITOR: Rogue OpenSSL execution from interactive shells
+  #
+  # Purpose:
+  #   Detect OpenSSL being launched manually or by shell-based tooling.
+  #
+  # Threat examples:
+  #   openssl s_client -connect attacker.example:443
+  #   openssl enc -aes-256-cbc -in data.txt -out data.enc
+  ###########################################################################
+  - call: "sys_execve"
+    syscall: true
+    args:
+    - index: 0
+      type: "string"
+    - index: 1
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "/usr/bin/openssl"
+      matchBinaries:
+      - operator: "In"
+        values:
+        - "/bin/bash"
+        - "/bin/sh"
+        - "/usr/bin/zsh"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # C) MONITOR: Broad private key / certificate access
+  #
+  # Purpose:
+  #   Log access to common crypto material extensions by any process.
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"     # pathname
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Regex"
+        values:
+        - ".*\\.(key|pem|crt|cer|der|p12|pfx)$"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # D) MONITOR: OpenSSL accessing key / cert material
+  #
+  # Purpose:
+  #   Higher-signal subset of section C where /usr/bin/openssl is directly
+  #   touching key/cert material.
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/bin/openssl"
+      matchArgs:
+      - index: 1
+        operator: "Regex"
+        values:
+        - ".*\\.(key|pem|p12|pfx|crt|cer|der)$"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # E) MONITOR: OpenSSL shared library usage
+  #
+  # Purpose:
+  #   Detect processes loading OpenSSL libraries.
+  #
+  # Helps identify:
+  #   - OpenSSL 1.1 usage
+  #   - OpenSSL 3.x usage
+  #   - libssl/libcrypto consumers
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Contains"
+        values:
+        - "libcrypto.so"
+        - "libssl.so"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # F) MONITOR: Unexpected libcrypto loading
+  #
+  # Purpose:
+  #   Detect processes outside the expected allowlist loading libcrypto.
+  #
+  # Tune this allowlist for your environment.
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Contains"
+        values:
+        - "libcrypto.so"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/httpd"
+        - "/usr/sbin/haproxy"
+        - "/usr/sbin/sshd"
+        - "/usr/bin/ssh"
+        - "/usr/bin/curl"
+        - "/usr/bin/wget"
+        - "/usr/bin/openssl"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # G) MONITOR: Coarse TLS / SSH network activity
+  #
+  # Purpose:
+  #   Broad network activity signal from common TLS/SSH-capable binaries.
+  ###########################################################################
+  - call: "sys_connect"
+    syscall: true
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/sbin/sshd"
+        - "/usr/bin/ssh"
+        - "/usr/bin/openssl"
+        - "/usr/bin/curl"
+        - "/usr/bin/wget"
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/haproxy"
+        - "/usr/sbin/httpd"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # H) MONITOR: OpenSSL outbound TCP connections
+  #
+  # Purpose:
+  #   Detect OpenSSL used directly as a network client.
+  #
+  # Example:
+  #   openssl s_client -connect remote.example:443
+  ###########################################################################
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/bin/openssl"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # I) MONITOR: Outbound SSH sessions to Internet
+  #
+  # Purpose:
+  #   Log TCP/22 connections to public IP space.
+  #
+  # Excludes:
+  #   - RFC1918 private ranges
+  #   - loopback
+  #   - link-local
+  #   - CGNAT
+  #   - multicast
+  #   - zero network
+  ###########################################################################
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/bin/ssh"
+        - "/usr/sbin/sshd"
+        - "/usr/bin/openssl"
+      matchArgs:
+      - index: 0
+        operator: "DPort"
+        values:
+        - "22"
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "100.64.0.0/10"
+        - "224.0.0.0/4"
+        - "0.0.0.0/8"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # J) MONITOR: Any process accessing OpenSSL directories
+  #
+  # Purpose:
+  #   Detect access to OpenSSL configuration, cert stores, providers,
+  #   engines, modules, and related directories.
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Regex"
+        values:
+        - "^/etc/ssl/.*"
+        - "^/etc/pki/.*"
+        - "^/usr/lib/ssl/.*"
+        - "^/usr/lib64/ssl/.*"
+        - "^/usr/lib/openssl/.*"
+        - "^/usr/lib64/openssl/.*"
+        - "^/usr/lib/ossl-modules/.*"
+        - "^/usr/lib64/ossl-modules/.*"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # K) MONITOR: OpenSSL directory write/tamper signal
+  #
+  # Purpose:
+  #   Log any openat call into OpenSSL-related directories.
+  #
+  # Note:
+  #   This block is intentionally monitor-only. Depending on Tetragon version
+  #   and kernel argument handling, fine-grained write flag decoding may require
+  #   additional flag matching or downstream SIEM filtering.
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    - index: 2
+      type: "int"        # flags
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Regex"
+        values:
+        - "^/etc/ssl/.*"
+        - "^/etc/pki/.*"
+        - "^/usr/lib/ssl/.*"
+        - "^/usr/lib64/ssl/.*"
+        - "^/usr/lib/openssl/.*"
+        - "^/usr/lib64/openssl/.*"
+        - "^/usr/lib/ossl-modules/.*"
+        - "^/usr/lib64/ossl-modules/.*"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # L) ALERT: SSH RSA / ECDSA key loading
+  #
+  # Purpose:
+  #   Detect SSH/SSHD attempting to load RSA/ECDSA key material.
+  #
+  # Default:
+  #   Monitor only.
+  #
+  # Enforcement option:
+  #   Change action: Post to action: Sigkill after migration/tuning.
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/sbin/sshd"
+        - "/usr/bin/ssh"
+      matchArgs:
+      - index: 1
+        operator: "In"
+        values:
+        - "/etc/ssh/ssh_host_rsa_key"
+        - "/etc/ssh/ssh_host_ecdsa_key"
+        - "/root/.ssh/id_rsa"
+        - "/root/.ssh/id_ecdsa"
+      matchActions:
+      - action: "Post"
+      # ENFORCEMENT OPTION:
+      # - action: "Sigkill"
+
+  ###########################################################################
+  # UPROBES
+  #
+  # These detect classical RSA/ECDSA signing activity inside OpenSSL libcrypto.
+  #
+  # Default:
+  #   Monitor only.
+  #
+  # Enforcement option:
+  #   Change action: Post to action: Sigkill after testing.
+  ###########################################################################
+
+  uprobes:
+#These are optional but desirable for PQ
+  ###########################################################################
+  # M) ALERT: Classical RSA / ECDSA signing via OpenSSL 1.1
+  ###########################################################################
+  - path: "/usr/lib64/libcrypto.so.1.1"
+    symbols:
+    - "RSA_sign"
+    - "ECDSA_do_sign"
+    - "ECDSA_sign"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/sbin/sshd"
+        - "/usr/bin/ssh"
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/haproxy"
+        - "/usr/sbin/httpd"
+        - "/usr/bin/curl"
+        - "/usr/bin/wget"
+        - "/usr/bin/openssl"
+      matchActions:
+      - action: "Post"
+      # ENFORCEMENT OPTION:
+      # - action: "Sigkill"
+
+  ###########################################################################
+  # N) ALERT: Classical RSA / ECDSA signing via OpenSSL 3.x
+  ###########################################################################
+  - path: "/usr/lib64/libcrypto.so.3"
+    symbols:
+    - "RSA_sign"
+    - "ECDSA_do_sign"
+    - "ECDSA_sign"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/sbin/sshd"
+        - "/usr/bin/ssh"
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/haproxy"
+        - "/usr/sbin/httpd"
+        - "/usr/bin/curl"
+        - "/usr/bin/wget"
+        - "/usr/bin/openssl"
+      matchActions:
+      - action: "Post"
+      # ENFORCEMENT OPTION:
+      # - action: "Sigkill"
+

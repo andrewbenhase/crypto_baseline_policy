@@ -1,2 +1,1 @@
-# crypto_baseline_policy
-Tetragon Crypto Baseline Policy
+Initial crypto baseline policy for Tetragon use
