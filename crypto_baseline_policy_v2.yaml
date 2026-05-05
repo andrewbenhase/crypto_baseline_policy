@@ -1,0 +1,378 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: baseline-security-policy
+  annotations:
+    description: >
+      Monitor-only baseline security policy for outbound Internet TLS/SSH flows,
+      JA4 correlation context, crypto binary execution, OpenSSL abuse monitoring,
+      key/cert access, OpenSSL directory access, and Splunk/syslog forwarding.
+    mode: "monitor-only"
+spec:
+  kprobes:
+
+  ###########################################################################
+  # 0) MONITOR: Any process outbound TLS / SSH to Internet destinations
+  ###########################################################################
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "DPort"
+        values: ["22","443","8443","9443"]
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "100.64.0.0/10"
+        - "224.0.0.0/4"
+        - "0.0.0.0/8"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 1) MONITOR: JA4 correlation context for TLS-like Internet flows
+  #
+  # Note:
+  #   Tetragon does not calculate JA4 directly. This captures process/socket
+  #   context so Splunk can correlate with JA4 from Zeek, Suricata, or another
+  #   TLS sensor.
+  ###########################################################################
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "DPort"
+        values: ["443","8443","9443","853","993","995","465","587"]
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "100.64.0.0/10"
+        - "224.0.0.0/4"
+        - "0.0.0.0/8"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 2) MONITOR: TLS-capable binaries initiating Internet TLS flows
+  ###########################################################################
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/bin/openssl"
+        - "/usr/bin/curl"
+        - "/usr/bin/wget"
+        - "/usr/bin/python"
+        - "/usr/bin/python3"
+        - "/usr/bin/node"
+        - "/usr/bin/java"
+        - "/usr/bin/go"
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/httpd"
+        - "/usr/sbin/haproxy"
+      matchArgs:
+      - index: 0
+        operator: "DPort"
+        values: ["443","8443","9443","853","993","995","465","587"]
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "100.64.0.0/10"
+        - "224.0.0.0/4"
+        - "0.0.0.0/8"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 3) MONITOR: Crypto-capable binary execution inventory
+  ###########################################################################
+  - call: "sys_execve"
+    syscall: true
+    args:
+    - index: 0
+      type: "string"
+    - index: 1
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "In"
+        values:
+        - "/usr/bin/openssl"
+        - "/usr/bin/ssh"
+        - "/usr/sbin/sshd"
+        - "/usr/bin/curl"
+        - "/usr/bin/wget"
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/haproxy"
+        - "/usr/sbin/httpd"
+        - "/usr/bin/python"
+        - "/usr/bin/python3"
+        - "/usr/bin/node"
+        - "/usr/bin/java"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 4) MONITOR: OpenSSL CLI TLS probing for JA4 correlation
+  ###########################################################################
+  - call: "sys_execve"
+    syscall: true
+    args:
+    - index: 0
+      type: "string"
+    - index: 1
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values: ["/usr/bin/openssl"]
+      - index: 1
+        operator: "Contains"
+        values: ["s_client"]
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 5) MONITOR: Rogue OpenSSL execution from shells
+  ###########################################################################
+  - call: "sys_execve"
+    syscall: true
+    args:
+    - index: 0
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values: ["/usr/bin/openssl"]
+      matchBinaries:
+      - operator: "In"
+        values: ["/bin/bash","/bin/sh","/usr/bin/zsh"]
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 6) MONITOR: Private key / certificate access by any process
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Regex"
+        values: [".*\\.(key|pem|crt|cer|der|p12|pfx)$"]
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 7) MONITOR: OpenSSL key/cert access
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values: ["/usr/bin/openssl"]
+      matchArgs:
+      - index: 1
+        operator: "Regex"
+        values: [".*\\.(key|pem|p12|pfx|crt|cer|der)$"]
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 8) MONITOR: OpenSSL shared library usage
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Contains"
+        values: ["libcrypto.so","libssl.so"]
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 9) MONITOR: Unexpected libcrypto loading
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Contains"
+        values: ["libcrypto.so"]
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/httpd"
+        - "/usr/sbin/haproxy"
+        - "/usr/sbin/sshd"
+        - "/usr/bin/ssh"
+        - "/usr/bin/curl"
+        - "/usr/bin/wget"
+        - "/usr/bin/openssl"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 10) MONITOR: Coarse TLS / SSH network activity
+  ###########################################################################
+  - call: "sys_connect"
+    syscall: true
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/sbin/sshd"
+        - "/usr/bin/ssh"
+        - "/usr/bin/openssl"
+        - "/usr/bin/curl"
+        - "/usr/bin/wget"
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/haproxy"
+        - "/usr/sbin/httpd"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 11) MONITOR: OpenSSL outbound TCP connections
+  ###########################################################################
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values: ["/usr/bin/openssl"]
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 12) MONITOR: Outbound SSH sessions to Internet from SSH/OpenSSL binaries
+  ###########################################################################
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/bin/ssh"
+        - "/usr/sbin/sshd"
+        - "/usr/bin/openssl"
+      matchArgs:
+      - index: 0
+        operator: "DPort"
+        values: ["22"]
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "100.64.0.0/10"
+        - "224.0.0.0/4"
+        - "0.0.0.0/8"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 13) MONITOR: Any process accessing OpenSSL directories
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Regex"
+        values:
+        - "^/etc/ssl/.*"
+        - "^/etc/pki/.*"
+        - "^/usr/lib/ssl/.*"
+        - "^/usr/lib64/ssl/.*"
+        - "^/usr/lib/openssl/.*"
+        - "^/usr/lib64/openssl/.*"
+        - "^/usr/lib/ossl-modules/.*"
+        - "^/usr/lib64/ossl-modules/.*"
+      matchActions:
+      - action: "Post"
+
+  ###########################################################################
+  # 14) MONITOR: OpenSSL directory write/tamper signal
+  ###########################################################################
+  - call: "sys_openat"
+    syscall: true
+    args:
+    - index: 1
+      type: "string"
+    - index: 2
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Regex"
+        values:
+        - "^/etc/ssl/.*"
+        - "^/etc/pki/.*"
+        - "^/usr/lib/ssl/.*"
+        - "^/usr/lib64/ssl/.*"
+        - "^/usr/lib/openssl/.*"
+        - "^/usr/lib64/openssl/.*"
+        - "^/usr/lib/ossl-modules/.*"
+        - "^/usr/lib64/ossl-modules/.*"
+      matchActions:
+      - action: "Post"
